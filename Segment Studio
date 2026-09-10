@@ -1,0 +1,456 @@
+import json
+import os
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+from openai import OpenAI
+from sklearn.cluster import KMeans
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+# Load environment variables such as OPENAI_API_KEY from a .env file.
+load_dotenv()
+
+
+# ------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------
+
+def detect_id_columns(df: pd.DataFrame):
+    """Identify only clearly identifying columns that should not be used for clustering."""
+    ignored_columns = set()
+
+    for column in df.columns:
+        column_name = str(column).strip()
+        normalized_name = (
+            column_name.lower().replace(" ", "_").replace("-", "_").replace("/", "_")
+        )
+
+        exact_identifier_names = {
+            "id",
+            "uuid",
+            "identifier",
+            "index",
+            "record_id",
+            "recordid",
+            "row_id",
+            "rowid",
+            "unique_id",
+            "uniqueid",
+        }
+
+        clear_identifier_patterns = (
+            normalized_name in exact_identifier_names
+            or normalized_name.endswith("_id")
+            or normalized_name.endswith("_uuid")
+            or normalized_name.endswith("_identifier")
+            or normalized_name.endswith("_record_id")
+            or normalized_name.endswith("_row_id")
+        )
+
+        if clear_identifier_patterns:
+            ignored_columns.add(column)
+            continue
+
+        values = df[column]
+        valid_values = values.dropna()
+        if len(valid_values) == 0:
+            continue
+
+        unique_ratio = valid_values.nunique() / len(valid_values)
+        if unique_ratio > 0.95 and normalized_name not in {"customer", "user", "employee"}:
+            ignored_columns.add(column)
+
+    return sorted(ignored_columns)
+
+
+def get_feature_columns(df: pd.DataFrame):
+    """Return the feature columns to use in clustering and the ignored IDs."""
+    ignored_columns = detect_id_columns(df)
+    usable_columns = [col for col in df.columns if col not in ignored_columns]
+
+    if not usable_columns:
+        raise ValueError("No usable columns remain after ignoring obvious ID-like columns.")
+
+    numeric_columns = [
+        col for col in usable_columns if pd.api.types.is_numeric_dtype(df[col])
+    ]
+    categorical_columns = [
+        col for col in usable_columns if col not in numeric_columns
+    ]
+
+    return {
+        "all": usable_columns,
+        "numeric": numeric_columns,
+        "categorical": categorical_columns,
+        "ignored": ignored_columns,
+    }
+
+
+def prepare_data_for_clustering(df: pd.DataFrame):
+    """Clean, encode, and scale the data for K-Means clustering."""
+    feature_info = get_feature_columns(df)
+    numeric_columns = feature_info["numeric"]
+    categorical_columns = feature_info["categorical"]
+
+    if not numeric_columns and not categorical_columns:
+        raise ValueError(
+            "The dataset contains no usable numerical or categorical features for clustering."
+        )
+
+    selected_df = df[feature_info["all"]].copy()
+
+    # Fill missing numeric values with the median and categorical values with the mode.
+    for col in numeric_columns:
+        selected_df[col] = selected_df[col].fillna(selected_df[col].median())
+
+    for col in categorical_columns:
+        if selected_df[col].dropna().empty:
+            selected_df[col] = selected_df[col].fillna("missing")
+        else:
+            selected_df[col] = selected_df[col].fillna(
+                selected_df[col].mode(dropna=True).iloc[0]
+            )
+
+    numeric_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+
+    categorical_transformer = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            (
+                "onehot",
+                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+            ),
+        ]
+    )
+
+    transformers = []
+    if numeric_columns:
+        transformers.append(("num", numeric_transformer, numeric_columns))
+    if categorical_columns:
+        transformers.append(("cat", categorical_transformer, categorical_columns))
+
+    preprocessor = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+    )
+
+    transformed_data = preprocessor.fit_transform(selected_df)
+
+    return {
+        "df_clean": selected_df,
+        "X": transformed_data,
+        "preprocessor": preprocessor,
+        "feature_info": feature_info,
+        "numeric_columns": numeric_columns,
+        "categorical_columns": categorical_columns,
+    }
+
+
+def run_wcss_analysis(X: np.ndarray, min_k: int, max_k: int):
+    """Run K-Means for every K in the chosen range and calculate WCSS."""
+    if min_k < 1 or max_k < 1:
+        raise ValueError("K values must be at least 1.")
+
+    if min_k > max_k:
+        raise ValueError("The minimum K must be less than or equal to the maximum K.")
+
+    rows = []
+    for k in range(min_k, max_k + 1):
+        model = KMeans(n_clusters=k, n_init=10, random_state=42)
+        model.fit(X)
+        rows.append({"k": k, "wcss": float(model.inertia_)})
+
+    return pd.DataFrame(rows)
+
+
+def get_openai_api_key():
+    """Read the OpenAI API key from environment variables or Streamlit secrets."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+
+    if not api_key:
+        raise ValueError(
+            "Missing OpenAI API key. Add OPENAI_API_KEY to your .env file or Streamlit secrets."
+        )
+
+    return api_key
+
+
+def summarize_cluster(cluster_df: pd.DataFrame, numeric_columns, categorical_columns):
+    """Create a compact summary for one cluster so the LLM receives only useful information."""
+    summary = {
+        "count": int(len(cluster_df)),
+        "numeric_averages": {},
+        "categorical_modes": {},
+    }
+
+    for col in numeric_columns:
+        if col in cluster_df.columns:
+            values = cluster_df[col].dropna()
+            if not values.empty:
+                summary["numeric_averages"][col] = round(float(values.mean()), 3)
+
+    for col in categorical_columns:
+        if col in cluster_df.columns:
+            values = cluster_df[col].dropna()
+            if not values.empty:
+                summary["categorical_modes"][col] = values.mode().iloc[0]
+            else:
+                summary["categorical_modes"][col] = "missing"
+
+    return summary
+
+
+def explain_cluster_with_llm(cluster_summary):
+    """Ask the OpenAI model to generate a cluster name and description from the summary."""
+    client = OpenAI(api_key=get_openai_api_key())
+
+    prompt = f"""
+    You are a data analyst.
+    Based only on the cluster summary below, generate a short meaningful name and a one-line description.
+
+    Cluster summary:
+    {json.dumps(cluster_summary, ensure_ascii=False, indent=2)}
+
+    Return valid JSON with exactly two keys:
+    - name
+    - description
+    Do not include any extra text outside the JSON object.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.2,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful data analyst who names and describes segments in a concise way.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    content = response.choices[0].message.content
+    parsed = json.loads(content)
+
+    return {
+        "name": str(parsed.get("name", "Unnamed cluster")).strip(),
+        "description": str(parsed.get("description", "No description available.")).strip(),
+    }
+
+
+def get_cluster_summary_table(clustered_df: pd.DataFrame):
+    """Create a table with cluster_id, count, name, and description columns."""
+    cluster_table = (
+        clustered_df.groupby("cluster_id", as_index=False)
+        .size()
+        .rename(columns={"size": "count"})
+    )
+    cluster_table["name"] = ""
+    cluster_table["description"] = ""
+    return cluster_table[["cluster_id", "count", "name", "description"]]
+
+
+# ------------------------------------------------------------
+# Streamlit app
+# ------------------------------------------------------------
+
+st.set_page_config(page_title="Studio Segment", page_icon="📊", layout="wide")
+st.title("📊 Studio Segment")
+st.subheader("Automatic Data Segmentation")
+
+# Step 1 - Upload CSV
+st.header("Step 1 - Upload CSV")
+uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"])
+
+if uploaded_file is None:
+    st.info("Please upload a CSV file to begin.")
+    st.stop()
+
+try:
+    raw_df = pd.read_csv(uploaded_file)
+    st.session_state["raw_df"] = raw_df
+except Exception as exc:
+    st.error(f"The CSV file could not be read: {exc}")
+    st.stop()
+
+st.success("CSV file uploaded successfully.")
+
+col1, col2 = st.columns(2)
+col1.metric("Rows", len(raw_df))
+col2.metric("Columns", len(raw_df.columns))
+
+st.write("Dataset preview:")
+st.dataframe(raw_df.head(20), use_container_width=True)
+
+# Step 2 - Preprocessing
+st.header("Step 2 - Preprocessing")
+try:
+    prep_result = prepare_data_for_clustering(raw_df)
+    st.session_state["prep_result"] = prep_result
+    feature_info = prep_result["feature_info"]
+
+    st.success("Preprocessing completed successfully.")
+
+    st.write("Ignored columns:")
+    if feature_info["ignored"]:
+        st.code(", ".join(feature_info["ignored"]))
+    else:
+        st.write("No obvious ID-like columns were found.")
+
+    st.write("Columns used for clustering:")
+    st.code(", ".join(feature_info["all"]))
+
+    st.write("Numeric columns:")
+    st.code(", ".join(feature_info["numeric"]) if feature_info["numeric"] else "None")
+
+    st.write("Categorical columns:")
+    st.code(", ".join(feature_info["categorical"]) if feature_info["categorical"] else "None")
+
+    st.markdown(
+        """
+        - Missing numeric values were filled using the median.
+        - Missing categorical values were filled using the most common value.
+        - Categorical columns were encoded into numeric features.
+        - Numerical features were standardized before K-Means.
+        """
+    )
+except ValueError as exc:
+    st.error(f"Preprocessing failed: {exc}")
+    st.stop()
+
+# Step 3 - Elbow Method
+st.header("Step 3 - Elbow Method")
+
+max_possible_k = max(1, min(20, len(raw_df) - 1))
+min_k = st.number_input("Minimum K", min_value=1, max_value=max_possible_k, value=2)
+max_k = st.number_input("Maximum K", min_value=1, max_value=max_possible_k, value=min(5, max_possible_k))
+
+if min_k > max_k:
+    st.error("The minimum K must be less than or equal to the maximum K.")
+    st.stop()
+
+if st.button("Calculate WCSS"):
+    try:
+        wcss_df = run_wcss_analysis(prep_result["X"], min_k, max_k)
+        st.session_state["wcss_df"] = wcss_df
+
+        st.write("WCSS results:")
+        st.dataframe(wcss_df, use_container_width=True)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(wcss_df["k"], wcss_df["wcss"], marker="o")
+        ax.set_xlabel("K")
+        ax.set_ylabel("WCSS")
+        ax.set_title("Elbow Method")
+        ax.grid(True)
+        st.pyplot(fig)
+    except Exception as exc:
+        st.error(f"Failed to calculate WCSS: {exc}")
+
+# Step 4 - Create Clusters
+st.header("Step 4 - Create Clusters")
+
+if "wcss_df" in st.session_state:
+    available_ks = list(range(int(st.session_state["wcss_df"]["k"].min()), int(st.session_state["wcss_df"]["k"].max()) + 1))
+else:
+    available_ks = list(range(min_k, max_k + 1))
+
+final_k = st.selectbox("Choose the final K", options=available_ks)
+
+if final_k >= len(raw_df):
+    st.error("K must be smaller than the number of rows in the dataset.")
+    st.stop()
+
+if st.button("Create clusters"):
+    try:
+        model = KMeans(n_clusters=final_k, n_init=10, random_state=42)
+        labels = model.fit_predict(prep_result["X"])
+
+        clustered_df = raw_df.copy()
+        clustered_df["cluster_id"] = labels
+        st.session_state["clustered_df"] = clustered_df
+
+        cluster_summary_table = get_cluster_summary_table(clustered_df)
+        st.session_state["cluster_summary_table"] = cluster_summary_table
+
+        st.write("Cluster counts:")
+        st.dataframe(cluster_summary_table, use_container_width=True)
+    except Exception as exc:
+        st.error(f"Cluster creation failed: {exc}")
+
+# Step 5 - Explain Clusters with LLM
+st.header("Step 5 - Explain Clusters with LLM")
+
+if "cluster_summary_table" in st.session_state:
+    if st.button("Explain clusters with LLM"):
+        try:
+            rows = []
+            numeric_columns = prep_result["numeric_columns"]
+            categorical_columns = prep_result["categorical_columns"]
+
+            for cluster_id, group in st.session_state["clustered_df"].groupby("cluster_id"):
+                summary = summarize_cluster(group, numeric_columns, categorical_columns)
+                llm_result = explain_cluster_with_llm(summary)
+
+                rows.append(
+                    {
+                        "cluster_id": int(cluster_id),
+                        "count": int(summary["count"]),
+                        "name": llm_result["name"],
+                        "description": llm_result["description"],
+                    }
+                )
+
+            final_cluster_table = pd.DataFrame(rows)
+            st.session_state["final_cluster_table"] = final_cluster_table
+
+            st.write("Final cluster table:")
+            st.dataframe(final_cluster_table[["cluster_id", "count", "name", "description"]], use_container_width=True)
+        except ValueError as exc:
+            st.error(f"LLM configuration error: {exc}")
+        except Exception as exc:
+            st.error(f"Cluster explanation failed: {exc}")
+else:
+    st.info("Create clusters before explaining them with the LLM.")
+
+# Step 6 - Export CSV
+st.header("Step 6 - Export CSV")
+
+if "final_cluster_table" in st.session_state:
+    export_df = st.session_state["clustered_df"].copy()
+    cluster_name_map = (
+        st.session_state["final_cluster_table"].set_index("cluster_id")["name"].to_dict()
+    )
+    export_df["name_cluster"] = export_df["cluster_id"].map(cluster_name_map)
+
+    original_name = uploaded_file.name.rsplit(".", 1)[0]
+    output_name = f"{original_name}_clustered.csv"
+
+    csv_data = export_df.to_csv(index=False)
+    st.download_button(
+        label="Download clustered CSV",
+        data=csv_data,
+        file_name=output_name,
+        mime="text/csv",
+    )
+
+    st.write("Export preview:")
+    st.dataframe(export_df[["cluster_id", "name_cluster"]].head(20), use_container_width=True)
+else:
+    st.info("Create and explain the clusters before exporting the final CSV file.")
+
+# End of app
